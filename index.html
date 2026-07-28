@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#111326">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Luna Daily">
+  <meta name="description" content="A private, local-first cycle tracker.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+  <title>Luna Daily</title>
+</head>
+<body>
+  <div id="privacyCurtain" class="privacy-curtain" aria-hidden="true">
+    <div class="privacy-mark">◐</div>
+    <p>Luna Daily</p>
+  </div>
+
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow" id="greeting">Good evening</p>
+        <h1 id="screenTitle">Today</h1>
+      </div>
+      <button class="icon-button" id="quickBackupBtn" aria-label="Create backup" title="Create backup">⇩</button>
+    </header>
+
+    <main id="mainContent" class="main-content" tabindex="-1"></main>
+
+    <nav class="bottom-nav" aria-label="Primary navigation">
+      <button data-route="today" class="nav-item active"><span>◐</span><small>Today</small></button>
+      <button data-route="calendar" class="nav-item"><span>▦</span><small>Calendar</small></button>
+      <button data-route="insights" class="nav-item"><span>⌁</span><small>Insights</small></button>
+      <button data-route="settings" class="nav-item"><span>⚙</span><small>Settings</small></button>
+    </nav>
+  </div>
+
+  <div id="modalRoot"></div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <template id="onboardingTemplate">
+    <section class="onboarding">
+      <div class="hero-orb"><span>◐</span></div>
+      <p class="eyebrow">Private by design</p>
+      <h2>Your calm cycle companion</h2>
+      <p class="lede">Track periods, symptoms and patterns. Your entries stay on this device unless you export a backup.</p>
+      <div class="privacy-points">
+        <div><b>No account</b><span>No email, login or cloud profile.</span></div>
+        <div><b>No analytics</b><span>No advertising or behavioural tracking.</span></div>
+        <div><b>Local storage</b><span>Install first, then begin entering real data.</span></div>
+      </div>
+      <button class="primary-button" data-action="start-onboarding">Get started</button>
+      <button class="text-button" data-action="restore-backup">Restore a backup</button>
+    </section>
+  </template>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
