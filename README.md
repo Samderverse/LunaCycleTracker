@@ -21,29 +21,6 @@ A private, mobile-first period and cycle tracker for one person's personal use.
 - Restore and delete-all controls
 - No accounts, analytics, advertising, database or third-party runtime services
 
-## Publish through GitHub Pages
-
-1. Create a public GitHub repository, for example `LunaCycleTracker`.
-2. Open the repository and choose **Add file → Upload files**.
-3. Drag the contents of this folder into GitHub. Keep the `icons` folder intact.
-4. Commit the upload.
-5. Open **Settings → Pages**.
-6. Under **Build and deployment**, choose **Deploy from a branch**.
-7. Select `main` and `/ (root)`, then save.
-8. Wait for GitHub to provide the Pages address.
-
-The repository root should contain:
-
-```text
-index.html
-app.js
-styles.css
-service-worker.js
-manifest.webmanifest
-icons/
-```
-
-The `tests` folder and documentation files may also be uploaded, but the app does not require them at runtime.
 
 ## Install on iPhone
 
