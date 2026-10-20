@@ -1,4 +1,4 @@
-# Luna Daily v2.1.0
+# Luna Daily v2.1.1
 
 A private, mobile-first period and cycle tracker for one person's personal use.
 

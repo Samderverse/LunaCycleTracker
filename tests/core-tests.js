@@ -160,4 +160,103 @@ test('Dismissed notifications stay hidden for their dismissal period', () => {
   assert.equal(api.isNotificationDismissed(key), true);
 });
 
+// ---- v2.1.1 regression tests ----
+
+const relDay = n => api.addDays(api.dateToISO(new Date()), n);
+const dayLog = (date, bleeding, extra = {}) => ({ date, bleeding, countsAsPeriod: true, symptoms: [], moods: [], sexualActivity: [], notes: '', ...extra });
+
+test('One missed day inside a period does not split it', () => {
+  const s = structuredClone(api.defaultState);
+  s.logs = {};
+  ['2026-06-01', '2026-06-02', '2026-06-04', '2026-06-05'].forEach(d => { s.logs[d] = dayLog(d, 'medium'); });
+  api.setState(s);
+  api.rebuildPeriods();
+  const periods = api.getState().periods;
+  assert.equal(periods.length, 1);
+  assert.equal(periods[0].endDate, '2026-06-05');
+});
+
+test('Two missed days are bridged but a longer gap starts a new period', () => {
+  const s = structuredClone(api.defaultState);
+  s.logs = {};
+  ['2026-06-01', '2026-06-04', '2026-06-20'].forEach(d => { s.logs[d] = dayLog(d, 'light'); });
+  api.setState(s);
+  api.rebuildPeriods();
+  assert.deepEqual(api.getState().periods.map(p => p.startDate), ['2026-06-01', '2026-06-20']);
+});
+
+test('Migration counts light, medium and heavy days saved without the period box', () => {
+  const s = structuredClone(api.defaultState);
+  s.logs = {};
+  for (let i = 0; i < 5; i++) { const d = relDay(-30 + i); s.logs[d] = dayLog(d, 'heavy', { countsAsPeriod: false }); }
+  const spot = relDay(-10); s.logs[spot] = dayLog(spot, 'spotting', { countsAsPeriod: false });
+  api.setState(s);
+  api.migrateState('2.1.0');
+  const out = api.getState();
+  assert.equal(out.periods.length, 1);
+  assert.equal(out.logs[spot].countsAsPeriod, false, 'spotting must stay opt-in');
+});
+
+test('Migration leaves data alone when already on 2.1.1', () => {
+  const s = structuredClone(api.defaultState);
+  const d = relDay(-20);
+  s.logs = { [d]: dayLog(d, 'heavy', { countsAsPeriod: false }) };
+  api.setState(s);
+  api.migrateState('2.1.1');
+  assert.equal(api.getState().logs[d].countsAsPeriod, false);
+});
+
+test('Setup placeholder does not drag the average period length to one day', () => {
+  const s = structuredClone(api.defaultState);
+  s.settings.typicalPeriodLength = 5;
+  const first = relDay(-60);
+  // Shape of the log that setup created before 2.1.1: no sexualActivity field.
+  s.logs = { [first]: { date: first, bleeding: 'medium', countsAsPeriod: true, symptoms: [], moods: [], notes: '' } };
+  for (let i = 0; i < 6; i++) { const d = relDay(-32 + i); s.logs[d] = dayLog(d, 'medium'); }
+  api.setState(s);
+  api.migrateState('2.1.0');
+  assert.equal(api.averagePeriodLength(), 6);
+});
+
+test('Only placeholder history falls back to the configured period length', () => {
+  const s = structuredClone(api.defaultState);
+  s.settings.typicalPeriodLength = 5;
+  s.settings.recentPeriodStart = relDay(-40);
+  s.logs = {};
+  api.setState(s);
+  api.setRecentPeriodStart(relDay(-20));
+  assert.equal(api.averagePeriodLength(), 5);
+});
+
+test('Changing the period start in settings moves the prediction', () => {
+  const s = structuredClone(api.defaultState);
+  s.settings.typicalCycleLength = 28;
+  s.settings.recentPeriodStart = relDay(-40);
+  s.logs = {};
+  api.setState(s);
+  api.setRecentPeriodStart(relDay(-40));
+  const before = api.cycleData().latestStart;
+  api.setRecentPeriodStart(relDay(-5));
+  const out = api.getState();
+  assert.notEqual(api.cycleData().latestStart, before);
+  assert.equal(api.cycleData().latestStart, relDay(-5));
+  assert.equal(out.logs[relDay(-40)], undefined, 'old placeholder should be removed');
+});
+
+test('Changing the period start keeps a real entry on the old date', () => {
+  const s = structuredClone(api.defaultState);
+  const old = relDay(-40);
+  s.settings.recentPeriodStart = old;
+  s.logs = { [old]: dayLog(old, 'heavy', { notes: 'real entry' }) };
+  api.setState(s);
+  api.setRecentPeriodStart(relDay(-5));
+  assert.equal(api.getState().logs[old].notes, 'real entry');
+});
+
+test('Version comparison orders patch releases', () => {
+  assert(api.compareVersions('2.1.0', '2.1.1') < 0);
+  assert(api.compareVersions('2.10.0', '2.9.9') > 0);
+  assert.equal(api.compareVersions('2.1.1', '2.1.1'), 0);
+});
+
 console.log(`\n${passed} core tests passed.`);
