@@ -1,10 +1,13 @@
-const CACHE = 'luna-daily-v2.1.0';
+const CACHE = 'luna-daily-v2.1.1';
 const ASSETS = [
   './','./index.html','./styles.css','./app.js','./manifest.webmanifest',
   './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'
 ];
 self.addEventListener('install', event => event.waitUntil(
-  caches.open(CACHE).then(cache => cache.addAll(ASSETS)).then(() => self.skipWaiting())
+  caches.open(CACHE)
+    // Bypass the browser's HTTP cache so a new version never installs stale copies of its files.
+    .then(cache => cache.addAll(ASSETS.map(url => new Request(url, { cache: 'reload' }))))
+    .then(() => self.skipWaiting())
 ));
 self.addEventListener('activate', event => event.waitUntil(
   caches.keys().then(keys => Promise.all(keys.filter(key => key !== CACHE).map(key => caches.delete(key))))
