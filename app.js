@@ -1,8 +1,15 @@
 'use strict';
 
-const APP_VERSION = '2.1.0';
+const APP_VERSION = '2.1.1';
 const DB_NAME = 'lunaDailyDB';
 const STORE = 'appState';
+const PERIOD_BLEEDING = ['light','medium','heavy'];
+// Up to this many unlogged days inside a period are bridged, so one missed entry doesn't split it in two.
+const MAX_PERIOD_GAP_DAYS = 2;
+const UPDATE_NOTES = {
+  '2.1.0': 'In-app reminders have been added for daily logging, cycle timing, backups, cycle summaries and personal symptom patterns.',
+  '2.1.1': 'Fixes: light, medium and heavy bleeding now count as a period automatically, a missed day no longer splits a period in two, and backups save through the iPhone share sheet.'
+};
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
 const todayISO = () => dateToISO(new Date());
@@ -27,6 +34,8 @@ let calendarCursor = new Date(); calendarCursor.setDate(1);
 let selectedCalendarDate = todayISO();
 let db;
 let storageMode = 'indexeddb';
+let renderedOn = null;
+let pendingBackup = null;
 
 function openDB(){
   return new Promise((resolve,reject)=>{
@@ -54,14 +63,52 @@ function clamp(v,min,max){return Math.min(max,Math.max(min,v))}
 function mean(arr){return arr.length?arr.reduce((a,b)=>a+b,0)/arr.length:0}
 
 function rebuildPeriods(){
-  const dates=Object.values(state.logs).filter(l=>l.countsAsPeriod && ['light','medium','heavy'].includes(l.bleeding)).map(l=>l.date).sort();
+  const dates=Object.values(state.logs).filter(isPeriodLog).map(l=>l.date).sort();
   const periods=[]; let group=[];
   for(const date of dates){
-    if(!group.length || daysBetween(group.at(-1),date)<=1) group.push(date);
+    if(!group.length || daysBetween(group.at(-1),date)<=MAX_PERIOD_GAP_DAYS+1) group.push(date);
     else {periods.push(group);group=[date]}
   }
   if(group.length) periods.push(group);
-  state.periods=periods.map((g,i)=>({id:`period-${g[0]}`,startDate:g[0],endDate:g.at(-1),status:(daysBetween(g.at(-1),todayISO())<=1)?'current':'complete',excludedFromPredictions:state.excludedCycleStarts.includes(g[0])}));
+  state.periods=periods.map(g=>({
+    id:`period-${g[0]}`,startDate:g[0],endDate:g.at(-1),
+    status:(daysBetween(g.at(-1),todayISO())<=MAX_PERIOD_GAP_DAYS+1)?'current':'complete',
+    // A single day created by setup or by the settings start date only marks the start; its length is unknown.
+    lengthKnown:!(g.length===1&&state.logs[g[0]]?.seed),
+    excludedFromPredictions:state.excludedCycleStarts.includes(g[0])
+  }));
+}
+function isPeriodLog(l){return Boolean(l&&l.countsAsPeriod&&PERIOD_BLEEDING.includes(l.bleeding))}
+function seedPeriodLog(date){
+  const now=new Date().toISOString();
+  return {date,bleeding:'medium',countsAsPeriod:true,seed:true,symptoms:[],moods:[],energy:null,sleepHours:'',sleepQuality:'',medication:'',notes:'',createdAt:now,updatedAt:now};
+}
+function setRecentPeriodStart(date){
+  const previous=state.settings.recentPeriodStart;
+  state.settings.recentPeriodStart=date;
+  if(!date||date===previous)return;
+  // Remove the placeholder start created for the old date, if it was never edited into a real entry.
+  if(previous&&state.logs[previous]?.seed)delete state.logs[previous];
+  const existing=state.logs[date];
+  if(!existing)state.logs[date]=seedPeriodLog(date);
+  else if(!isPeriodLog(existing))state.logs[date]={...existing,bleeding:PERIOD_BLEEDING.includes(existing.bleeding)?existing.bleeding:'medium',countsAsPeriod:true,updatedAt:new Date().toISOString()};
+  rebuildPeriods();
+}
+function compareVersions(a,b){
+  const pa=String(a).split('.').map(n=>parseInt(n,10)||0),pb=String(b).split('.').map(n=>parseInt(n,10)||0);
+  for(let i=0;i<3;i++){if((pa[i]||0)!==(pb[i]||0))return (pa[i]||0)-(pb[i]||0)}
+  return 0;
+}
+function migrateState(fromVersion){
+  if(!fromVersion||fromVersion==='unknown'||compareVersions(fromVersion,'2.1.1')<0){
+    Object.values(state.logs||{}).forEach(l=>{
+      // Before 2.1.1 the "count as period" box started unticked, so light/medium/heavy days were often saved without it.
+      if(PERIOD_BLEEDING.includes(l.bleeding)&&!l.countsAsPeriod)l.countsAsPeriod=true;
+      // Setup created a one-day placeholder log. Saved daily-log entries always include sexualActivity; that placeholder never did.
+      if(isPeriodLog(l)&&!('sexualActivity' in l)&&!l.notes&&!(l.symptoms||[]).length)l.seed=true;
+    });
+  }
+  rebuildPeriods();
 }
 function cycleData(){
   rebuildPeriods();
@@ -101,6 +148,7 @@ function setHeader(){const titles={today:'Today',calendar:'Calendar',insights:'I
 function navigate(next){route=next;$$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.route===route));setHeader();render();$('#mainContent').focus({preventScroll:true})}
 
 function render(){
+  renderedOn=todayISO();
   setTheme();
   if(!state.onboardingComplete){renderOnboarding();return}
   if(route==='today') renderToday();
@@ -186,7 +234,7 @@ function endCycleSummaryNotice(c){
   if((state.notifications.seenCycleSummaries||[]).includes(currentStart))return null;
   const cycleLength=daysBetween(previousStart,currentStart);
   const previousPeriod=state.periods.find(p=>p.startDate===previousStart);
-  const periodLength=previousPeriod?daysBetween(previousPeriod.startDate,previousPeriod.endDate)+1:null;
+  const periodLength=previousPeriod?.lengthKnown?daysBetween(previousPeriod.startDate,previousPeriod.endDate)+1:null;
   const cycleLogs=Object.values(state.logs).filter(l=>l.date>=previousStart&&l.date<currentStart);
   const moods={};const symptoms={};
   cycleLogs.forEach(l=>{(l.moods||[]).forEach(x=>moods[x]=(moods[x]||0)+1);(l.symptoms||[]).forEach(x=>symptoms[x.name]=(symptoms[x.name]||0)+1)});
@@ -219,7 +267,7 @@ function buildNotifications(){
   const c=cycleData(),today=todayISO(),notices=[];
   if(state.notifications.updatedFromVersion&&state.notifications.lastSeenAppVersion!==APP_VERSION){
     const key=notificationKey('app-update',APP_VERSION);
-    notices.push({type:'update',key,icon:'✦',eyebrow:'App updated',title:`Luna Daily ${APP_VERSION} is ready`,body:'In-app reminders have been added for daily logging, cycle timing, backups, cycle summaries and personal symptom patterns.',actions:[{label:'Got it',action:'ack-update',key,primary:true}],dismissible:false});
+    notices.push({type:'update',key,icon:'✦',eyebrow:'App updated',title:`Luna Daily ${APP_VERSION} is ready`,body:UPDATE_NOTES[APP_VERSION]||'This version includes improvements and fixes.',actions:[{label:'Got it',action:'ack-update',key,primary:true}],dismissible:false});
   }
   if(!state.logs[today]){
     const key=notificationKey('daily-checkin',today);
@@ -249,11 +297,11 @@ function notificationCentre(){
   const notices=buildNotifications();if(!notices.length)return '';
   return `<section class="notice-centre"><div class="section-heading notice-heading"><h2>For you today</h2><p>${notices.length} reminder${notices.length===1?'':'s'}</p></div><div class="notice-stack">${notices.map(notificationCard).join('')}</div></section>`;
 }
-function averagePeriodLength(){rebuildPeriods();const complete=state.periods.filter(p=>p.status==='complete');return complete.length?Math.round(mean(complete.map(p=>daysBetween(p.startDate,p.endDate)+1))):state.settings.typicalPeriodLength}
+function averagePeriodLength(){rebuildPeriods();const complete=state.periods.filter(p=>p.status==='complete'&&p.lengthKnown);return complete.length?Math.round(mean(complete.map(p=>daysBetween(p.startDate,p.endDate)+1))):state.settings.typicalPeriodLength}
 
 function renderCalendar(){
-  const y=calendarCursor.getFullYear(),m=calendarCursor.getMonth();const first=new Date(y,m,1);const gridStart=new Date(y,m,1-((first.getDay()+6)%7));const c=cycleData();
-  let days='';for(let i=0;i<42;i++){const d=new Date(gridStart);d.setDate(gridStart.getDate()+i);const iso=dateToISO(d);const log=state.logs[iso];const confirmed=state.periods.some(p=>iso>=p.startDate&&iso<=p.endDate);const predicted=iso>=c.predictedStart&&iso<addDays(c.predictedStart,state.settings.typicalPeriodLength);days+=`<button class="day ${d.getMonth()!==m?'other':''} ${iso===todayISO()?'today':''} ${confirmed?'period':''} ${predicted&&!confirmed?'predicted':''} ${log?'has-log':''} ${iso===selectedCalendarDate?'selected':''}" data-action="select-day" data-date="${iso}" aria-label="${fmtDate(iso)}${confirmed?', period logged':''}${log?', entry saved':''}">${d.getDate()}</button>`}
+  const y=calendarCursor.getFullYear(),m=calendarCursor.getMonth();const first=new Date(y,m,1);const gridStart=new Date(y,m,1-((first.getDay()+6)%7));const c=cycleData();const predictedDays=averagePeriodLength();
+  let days='';for(let i=0;i<42;i++){const d=new Date(gridStart);d.setDate(gridStart.getDate()+i);const iso=dateToISO(d);const log=state.logs[iso];const confirmed=state.periods.some(p=>iso>=p.startDate&&iso<=p.endDate);const predicted=iso>=c.predictedStart&&iso<addDays(c.predictedStart,predictedDays);days+=`<button class="day ${d.getMonth()!==m?'other':''} ${iso===todayISO()?'today':''} ${confirmed?'period':''} ${predicted&&!confirmed?'predicted':''} ${log?'has-log':''} ${iso===selectedCalendarDate?'selected':''}" data-action="select-day" data-date="${iso}" aria-label="${fmtDate(iso)}${confirmed?', period logged':''}${log?', entry saved':''}">${d.getDate()}</button>`}
   const selected=state.logs[selectedCalendarDate];
   $('#mainContent').innerHTML=`<section class="card"><div class="calendar-head"><button data-action="month-prev" aria-label="Previous month">‹</button><h2>${calendarCursor.toLocaleDateString('en-GB',{month:'long',year:'numeric'})}</h2><button data-action="month-next" aria-label="Next month">›</button></div><div class="calendar-grid">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(x=>`<div class="weekday">${x}</div>`).join('')}${days}</div><div class="calendar-legend"><span><i class="legend-dot confirmed"></i>Logged period</span><span><i class="legend-dot predicted"></i>Predicted period</span><span>• Daily entry</span></div></section><section class="card"><p class="eyebrow">${fmtDate(selectedCalendarDate,{weekday:'long',day:'numeric',month:'long'})}</p>${selected?dailySummary(selected).replace('<section class="card summary-list">','<div class="summary-list">').replace('</section>','</div>'):'<p class="muted">Nothing logged for this day.</p>'}<button class="primary-button" data-action="log-date" data-date="${selectedCalendarDate}">${selected?'Edit entry':'Log this day'}</button></section>`;
 }
@@ -277,8 +325,22 @@ function renderSettings(){
 }
 function toggleRow(label,key){return `<div class="toggle-row"><span>${label}</span><button class="toggle ${state.settings[key]?'on':''}" data-action="toggle-setting" data-key="${key}" role="switch" aria-checked="${state.settings[key]}"></button></div>`}
 
-function showModal(html){$('#modalRoot').innerHTML=`<div class="modal-backdrop"><section class="modal-sheet" role="dialog" aria-modal="true">${html}</section></div>`;$('.modal-sheet').focus()}
-function closeModal(){$('#modalRoot').innerHTML=''}
+let modalReturnFocus=null;
+function showModal(html){
+  if(!$('#modalRoot').innerHTML)modalReturnFocus=document.activeElement;
+  $('#modalRoot').innerHTML=`<div class="modal-backdrop"><section class="modal-sheet" role="dialog" aria-modal="true" tabindex="-1">${html}</section></div>`;
+  const sheet=$('.modal-sheet'),heading=sheet.querySelector('h2');
+  if(heading){heading.id='modalTitle';sheet.setAttribute('aria-labelledby','modalTitle')}
+  syncChipState(sheet);
+  sheet.focus({preventScroll:true});
+}
+function closeModal(){
+  $('#modalRoot').innerHTML='';pendingBackup=null;
+  if(modalReturnFocus&&document.contains(modalReturnFocus))modalReturnFocus.focus({preventScroll:true});
+  modalReturnFocus=null;
+}
+// Expose chip selection to screen readers: single-choice and multi-choice chips act as toggle buttons.
+function syncChipState(root){$$('.chips .chip',root).forEach(chip=>chip.setAttribute('aria-pressed',String(chip.classList.contains('selected')||chip.classList.contains('period-selected'))))}
 function onboardingModal(){showModal(`<div class="modal-head"><h2>Set up your cycle</h2><button class="close-button" data-action="close-modal">×</button></div><form id="onboardingForm"><div class="field"><label for="recentStart">First day of your most recent period</label><input class="input" id="recentStart" name="recentStart" type="date" max="${todayISO()}" value="${state.settings.recentPeriodStart}" required></div><div class="field"><label>Typical cycle length</label><div class="chips" data-single="cycleLength">${[24,26,28,30,32,35].map(v=>`<button type="button" class="chip ${v===28?'selected':''}" data-value="${v}">${v} days</button>`).join('')}</div><input type="hidden" name="cycleLength" value="28"></div><div class="field"><label>Typical period length</label><div class="chips" data-single="periodLength">${[3,4,5,6,7].map(v=>`<button type="button" class="chip ${v===5?'selected':''}" data-value="${v}">${v} days</button>`).join('')}</div><input type="hidden" name="periodLength" value="5"></div><label class="toggle-row"><span>I understand that deleting browser or app data may remove my entries.</span><input type="checkbox" name="ack" required></label><button class="primary-button" type="submit">Create my tracker</button></form>`)}
 
 function logModal(date){
@@ -286,7 +348,7 @@ function logModal(date){
   const bleed=['none','spotting','light','medium','heavy'];const symptoms=['cramps','bloating','headache','migraine','breast tenderness','back pain','pelvic pain','nausea','digestive changes','acne','cravings','fatigue','dizziness','hot flushes'];const moods=['calm','happy','confident','sociable','focused','sensitive','anxious','irritable','low','overwhelmed','tearful','emotionally flat'];
   showModal(`<div class="modal-head"><div><p class="eyebrow">Daily log</p><h2>${fmtDate(date,{weekday:'long',day:'numeric',month:'long'})}</h2></div><button class="close-button" data-action="close-modal">×</button></div><form id="logForm" data-date="${date}">
   <div class="field"><label>Bleeding</label><div class="chips" data-single="bleeding">${bleed.map(v=>`<button type="button" class="chip ${l.bleeding===v?'period-selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="bleeding" value="${l.bleeding}"></div>
-  <div class="field"><label class="toggle-row"><span>Count this as part of a period</span><input type="checkbox" name="countsAsPeriod" ${l.countsAsPeriod?'checked':''}></label><small>Spotting alone will not start a new cycle unless you choose this.</small></div>
+  <div class="field"><label class="toggle-row"><span>Count this as part of a period</span><input type="checkbox" name="countsAsPeriod" ${l.countsAsPeriod?'checked':''}></label><small>Ticked automatically for light, medium or heavy bleeding. Spotting won’t start a new cycle unless you tick this.</small></div>
   <div class="field"><label>Physical symptoms</label><div class="chips" data-multi="symptoms">${symptoms.map(v=>`<button type="button" class="chip ${l.symptoms.some(s=>s.name===v)?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div></div>
   <div class="field"><label>Mood</label><div class="chips" data-multi="moods">${moods.map(v=>`<button type="button" class="chip ${l.moods.includes(v)?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div></div>
   <div class="field"><label>Energy</label><div class="chips" data-single="energy">${['Very low','Low','Average','High','Very high'].map((v,i)=>`<button type="button" class="chip ${l.energy===i+1?'selected':''}" data-value="${i+1}">${v}</button>`).join('')}</div><input type="hidden" name="energy" value="${l.energy||''}"></div>
@@ -303,7 +365,7 @@ function bindEvents(){
   document.addEventListener('click',async e=>{
     const btn=e.target.closest('[data-action],.nav-item,.chips .chip');if(!btn)return;
     if(btn.classList.contains('nav-item')){navigate(btn.dataset.route);return}
-    if(btn.matches('.chips .chip')){const group=btn.closest('.chips');if(group.dataset.single){group.querySelectorAll('.chip').forEach(x=>x.classList.remove('selected','period-selected'));btn.classList.add(group.dataset.single==='bleeding'?'period-selected':'selected');group.parentElement.querySelector(`input[name="${group.dataset.single}"]`).value=btn.dataset.value}else btn.classList.toggle('selected');return}
+    if(btn.matches('.chips .chip')){const group=btn.closest('.chips');if(group.dataset.single){group.querySelectorAll('.chip').forEach(x=>x.classList.remove('selected','period-selected'));btn.classList.add(group.dataset.single==='bleeding'?'period-selected':'selected');group.parentElement.querySelector(`input[name="${group.dataset.single}"]`).value=btn.dataset.value;if(group.dataset.single==='bleeding'){const box=btn.closest('form')?.querySelector('input[name="countsAsPeriod"]');if(box)box.checked=PERIOD_BLEEDING.includes(btn.dataset.value)}}else btn.classList.toggle('selected');syncChipState(group);return}
     const a=btn.dataset.action;
     if(a==='start-onboarding')onboardingModal();
     if(a==='close-modal')closeModal();
@@ -316,6 +378,7 @@ function bindEvents(){
     if(a==='edit-cycle-settings')editCycleModal();
     if(a==='export-backup')backupPrompt();
     if(a==='restore-backup')restoreBackupPrompt();
+    if(a==='save-backup')await saveBackupFile();
     if(a==='dismiss-notice'){
       const key=btn.dataset.key,days=btn.dataset.days;
       state.notifications.dismissed[key]=days==='forever'?'forever':addDays(todayISO(),Number(days)||0);
@@ -335,15 +398,20 @@ function bindEvents(){
   });
   document.addEventListener('submit',async e=>{
     e.preventDefault();const f=e.target;
-    if(f.id==='onboardingForm'){const data=new FormData(f);state.settings.recentPeriodStart=data.get('recentStart');state.settings.typicalCycleLength=Number(data.get('cycleLength'));state.settings.typicalPeriodLength=Number(data.get('periodLength'));state.onboardingComplete=true;state.logs[state.settings.recentPeriodStart]={date:state.settings.recentPeriodStart,bleeding:'medium',countsAsPeriod:true,symptoms:[],moods:[],energy:null,sleepHours:'',sleepQuality:'',medication:'',notes:'',createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};rebuildPeriods();await saveState();closeModal();render();toast('Your tracker is ready')}
+    if(f.id==='onboardingForm'){const data=new FormData(f);state.settings.recentPeriodStart=data.get('recentStart');state.settings.typicalCycleLength=Number(data.get('cycleLength'));state.settings.typicalPeriodLength=Number(data.get('periodLength'));state.onboardingComplete=true;state.logs[state.settings.recentPeriodStart]=seedPeriodLog(state.settings.recentPeriodStart);rebuildPeriods();await saveState();closeModal();setHeader();render();toast('Your tracker is ready')}
     if(f.id==='logForm'){const data=new FormData(f),date=f.dataset.date;const existing=state.logs[date];state.logs[date]={date,bleeding:data.get('bleeding'),countsAsPeriod:data.get('countsAsPeriod')==='on',symptoms:selectedValues(f,'symptoms').map(name=>({name,severity:'moderate'})),moods:selectedValues(f,'moods'),energy:Number(data.get('energy'))||null,sleepHours:data.get('sleepHours')?Number(data.get('sleepHours')):'',sleepQuality:data.get('sleepQuality')||'',cervicalFluid:data.get('cervicalFluid')||null,sexualActivity:selectedValues(f,'sexualActivity'),pregnancyTest:data.get('pregnancyTest')||null,ovulationTest:data.get('ovulationTest')||null,medication:data.get('medication').trim(),notes:data.get('notes').trim(),createdAt:existing?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};rebuildPeriods();state.notifications.dismissed[notificationKey('daily-checkin',date)]='forever';await saveState();closeModal();render();toast('Entry saved')}
-    if(f.id==='cycleSettingsForm'){const data=new FormData(f);state.settings.recentPeriodStart=data.get('recentPeriodStart');state.settings.typicalCycleLength=clamp(Number(data.get('typicalCycleLength')),15,60);state.settings.typicalPeriodLength=clamp(Number(data.get('typicalPeriodLength')),1,14);await saveState();closeModal();render();toast('Settings saved')}
+    if(f.id==='cycleSettingsForm'){const data=new FormData(f);setRecentPeriodStart(data.get('recentPeriodStart'));state.settings.typicalCycleLength=clamp(Number(data.get('typicalCycleLength')),15,60);state.settings.typicalPeriodLength=clamp(Number(data.get('typicalPeriodLength')),1,14);await saveState();closeModal();render();toast('Settings saved')}
     if(f.id==='backupForm'){const data=new FormData(f),password=String(data.get('password')||''),confirm=String(data.get('confirmPassword')||'');if(password&&password.length<8){toast('Use at least 8 characters');return}if(password!==confirm){toast('Passwords do not match');return}await exportBackup(password)}
     if(f.id==='restoreForm')await restoreFromFile(f);
     if(f.id==='deleteAllForm'){if(new FormData(f).get('confirm')==='DELETE'){state=structuredClone(defaultState);await saveState();closeModal();route='today';render();toast('All data deleted')}else toast('Type DELETE exactly')}
   });
   $('#quickBackupBtn').addEventListener('click',backupPrompt);
-  document.addEventListener('visibilitychange',()=>{if(state.settings.privacyCurtain)$('#privacyCurtain').classList.toggle('show',document.hidden)});
+  document.addEventListener('visibilitychange',()=>{
+    if(state.settings.privacyCurtain)$('#privacyCurtain').classList.toggle('show',document.hidden);
+    // An installed web app can stay in memory overnight; refresh dates and reminders when it is reopened on a new day.
+    if(!document.hidden&&renderedOn!==todayISO()){setHeader();if(!$('#modalRoot').innerHTML)render()}
+  });
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('#modalRoot').innerHTML)closeModal()});
 }
 function selectedValues(form,name){const group=form.querySelector(`[data-multi="${name}"]`);return group?[...group.querySelectorAll('.chip.selected')].map(x=>x.dataset.value):[]}
 
@@ -374,10 +442,35 @@ async function exportBackup(password=''){
       output=JSON.stringify({format:'luna-encrypted-backup',version:1,kdf:'PBKDF2-SHA256',iterations:250000,cipher:'AES-GCM',salt:bytesToB64(salt),iv:bytesToB64(iv),data:bytesToB64(encrypted)},null,2);
       ext='luna';
     }else output=JSON.stringify(payload,null,2);
-    const blob=new Blob([output],{type:'application/json'}),url=URL.createObjectURL(blob),a=document.createElement('a');
-    a.href=url;a.download=`luna-daily-backup-${todayISO()}.${ext}`;document.body.append(a);a.click();a.remove();URL.revokeObjectURL(url);
-    state.settings.lastBackupAt=new Date().toISOString();await saveState();closeModal();render();toast(password?'Encrypted backup exported':'Backup exported');
+    // Encryption takes long enough that the original tap no longer counts as a user gesture for the share sheet,
+    // so the file is prepared first and saved from a second tap.
+    pendingBackup={name:`luna-daily-backup-${todayISO()}.${ext}`,text:output,encrypted:Boolean(password)};
+    showModal(`<div class="modal-head"><div><p class="eyebrow">Private backup</p><h2>Your backup is ready</h2></div><button class="close-button" data-action="close-modal">×</button></div>
+      <p class="muted">${pendingBackup.encrypted?'Encrypted with your password.':'Readable JSON backup with no password.'} Save it somewhere private, such as Files or iCloud Drive.</p>
+      <p class="muted" style="font-size:12px">${escapeHTML(pendingBackup.name)}</p>
+      <button class="primary-button" data-action="save-backup">Save backup</button>`);
   }catch(e){toast('Backup could not be created')}
+}
+async function saveBackupFile(){
+  if(!pendingBackup)return;
+  const {name,text,encrypted}=pendingBackup;
+  // text/plain is accepted by the share sheet on every platform; the .json or .luna name is what restore checks.
+  const file=typeof File==='function'?new File([text],name,{type:'text/plain'}):null;
+  let saved=false;
+  if(file&&navigator.canShare?.({files:[file]})){
+    try{await navigator.share({files:[file],title:'Luna Daily backup'});saved=true}
+    catch(e){
+      if(e?.name==='AbortError'){toast('Backup not saved');return}
+      // Any other share failure falls through to a normal download.
+    }
+  }
+  if(!saved){
+    const url=URL.createObjectURL(new Blob([text],{type:'application/octet-stream'})),a=document.createElement('a');
+    a.href=url;a.download=name;document.body.append(a);a.click();a.remove();
+    // Revoking immediately can cancel the download in Safari.
+    setTimeout(()=>URL.revokeObjectURL(url),60000);
+  }
+  state.settings.lastBackupAt=new Date().toISOString();await saveState();closeModal();render();toast(encrypted?'Encrypted backup saved':'Backup saved');
 }
 function restoreBackupPrompt(){showModal(`<div class="modal-head"><div><p class="eyebrow">Restore</p><h2>Restore a backup</h2></div><button class="close-button" data-action="close-modal">×</button></div><form id="restoreForm"><div class="field"><label for="backupFile">Choose a Luna Daily backup</label><input class="input" id="backupFile" name="backupFile" type="file" accept="application/json,.json,.luna" required></div><div class="field"><label for="restorePassword">Password (encrypted backups only)</label><input class="input" id="restorePassword" name="password" type="password" autocomplete="current-password"></div><p class="warning">Restoring replaces the data currently held in this app.</p><button class="primary-button">Restore backup</button></form>`)}
 async function restoreFromFile(form){
@@ -390,7 +483,7 @@ async function restoreFromFile(form){
       parsed=JSON.parse(new TextDecoder().decode(decrypted));
     }
     if(![1,2].includes(parsed.schemaVersion)||!parsed.data?.settings||!parsed.data?.logs)throw new Error('Invalid');
-    state={...structuredClone(defaultState),...parsed.data,settings:{...defaultState.settings,...parsed.data.settings}};
+    state={...structuredClone(defaultState),...parsed.data,settings:{...defaultState.settings,...parsed.data.settings},notifications:{...structuredClone(defaultState.notifications),...parsed.data.notifications,dismissed:{...parsed.data.notifications?.dismissed},seenCycleSummaries:[...(parsed.data.notifications?.seenCycleSummaries||[])]}};migrateState(parsed.data.version||parsed.appVersion);
     await saveState();closeModal();render();toast('Backup restored');
   }catch(e){toast('Backup could not be restored. Check the file and password.')}
 }
@@ -399,9 +492,9 @@ function capitalize(s){return String(s||'').replace(/\b\w/g,c=>c.toUpperCase())}
 function escapeHTML(s){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
 
 async function init(){
-  try{await openDB();const saved=await dbGet();if(saved){const previousVersion=saved.version||'unknown';state={...structuredClone(defaultState),...saved,settings:{...defaultState.settings,...saved.settings},notifications:{...defaultState.notifications,...saved.notifications,dismissed:{...defaultState.notifications.dismissed,...saved.notifications?.dismissed},seenCycleSummaries:[...(saved.notifications?.seenCycleSummaries||[])]}};if(previousVersion!==APP_VERSION){state.notifications.updatedFromVersion=previousVersion;state.notifications.lastSeenAppVersion=previousVersion;}}else await dbPut(state)}catch(e){
+  try{await openDB();const saved=await dbGet();if(saved){const previousVersion=saved.version||'unknown';state={...structuredClone(defaultState),...saved,settings:{...defaultState.settings,...saved.settings},notifications:{...defaultState.notifications,...saved.notifications,dismissed:{...defaultState.notifications.dismissed,...saved.notifications?.dismissed},seenCycleSummaries:[...(saved.notifications?.seenCycleSummaries||[])]}};if(previousVersion!==APP_VERSION){state.notifications.updatedFromVersion=previousVersion;state.notifications.lastSeenAppVersion=previousVersion;}migrateState(previousVersion);}else await dbPut(state)}catch(e){
     storageMode='localstorage';
-    try{const raw=localStorage.getItem(DB_NAME);if(raw){const saved=JSON.parse(raw),previousVersion=saved.version||'unknown';state={...structuredClone(defaultState),...saved,settings:{...defaultState.settings,...saved.settings},notifications:{...defaultState.notifications,...saved.notifications,dismissed:{...defaultState.notifications.dismissed,...saved.notifications?.dismissed},seenCycleSummaries:[...(saved.notifications?.seenCycleSummaries||[])]}};if(previousVersion!==APP_VERSION){state.notifications.updatedFromVersion=previousVersion;state.notifications.lastSeenAppVersion=previousVersion;}}else localStorage.setItem(DB_NAME,JSON.stringify(state));}
+    try{const raw=localStorage.getItem(DB_NAME);if(raw){const saved=JSON.parse(raw),previousVersion=saved.version||'unknown';state={...structuredClone(defaultState),...saved,settings:{...defaultState.settings,...saved.settings},notifications:{...defaultState.notifications,...saved.notifications,dismissed:{...defaultState.notifications.dismissed,...saved.notifications?.dismissed},seenCycleSummaries:[...(saved.notifications?.seenCycleSummaries||[])]}};if(previousVersion!==APP_VERSION){state.notifications.updatedFromVersion=previousVersion;state.notifications.lastSeenAppVersion=previousVersion;}migrateState(previousVersion);}else localStorage.setItem(DB_NAME,JSON.stringify(state));}
     catch(err){alert('Luna Daily could not access private browser storage on this device.');return}
   }
   if(state.version!==APP_VERSION||state.notifications.updatedFromVersion)await saveState();
@@ -412,6 +505,7 @@ async function init(){
 if (globalThis.__LUNA_TEST_MODE__) {
   globalThis.__LUNA_TEST_API__ = {
     parseISO, dateToISO, addDays, daysBetween, clamp, mean, rebuildPeriods, cycleData, buildNotifications, notificationKey, isNotificationDismissed,
+    averagePeriodLength, migrateState, setRecentPeriodStart, compareVersions, isPeriodLog,
     setState(value) { state = structuredClone(value); },
     getState() { return structuredClone(state); },
     defaultState: structuredClone(defaultState)
