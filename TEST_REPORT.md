@@ -1,14 +1,14 @@
-# Luna Daily v2.1.1 — Test report
+# Luna Daily v3.0.0 — Test report
 
-Tested on 20 October 2026 in the build environment.
+Tested on 17 November 2026 in the build environment.
 
 ## Automated checks completed
 
 - JavaScript syntax validation with Node.js.
-- 21 core logic tests: the original 12, plus 9 regression tests for this release covering missed-day bridging, the gap limit between periods, upgrading entries saved without the period box, spotting staying opt-in, the setup placeholder and average period length, changing the period start in Settings, keeping real entries when the start changes, and version comparison.
-- Static PWA audit (unchanged checks) passes.
-- Headless Chromium smoke test at iPhone size: setup, header title, the period box ticking and unticking with bleeding choice, chip and dialog accessibility attributes, Escape to close, backup prepare-and-save flow with download fallback, and upgrading a stored 2.1.0 state (update notice shown, unticked heavy days counted). No console errors.
+- 30 core logic tests: the 21 from 2.1.1, plus 9 new tests covering the fertile window looking ahead once passed, three-cycle period projections, calendar fertile shading following the setting, ring segments, the first-cycle celebration for new and upgrading users, the weekly backup snooze, and sentence-case labels.
+- Static PWA audit passes.
+- Headless Chromium at iPhone size, dark and light themes: setup, Today layout with the cycle card first, compact reminders, the daily log (switch turning on for heavy bleeding, More details closed by default, Save always visible), the first-cycle celebration appearing once only, calendar swipe and Back to today, tapping an Insights cycle to open its month, backup prepare-and-save, Escape closing pop-ups, and upgrading stored 2.1.1 data. No console errors.
 
 ## Remaining real-device check
 
-On the installed iPhone app after GitHub Pages updates: open the app and confirm the 2.1.1 notice appears and existing entries are intact; create a backup and confirm the share sheet opens and the file saves to Files; restore that backup; and log a day with heavy bleeding to confirm the period box ticks itself.
+On the installed iPhone app after GitHub Pages updates: confirm the 3.0.0 notice appears and entries are intact; swipe between calendar months; check the haptic tap when saving an entry (iOS 18 or later); and make and save a backup.
