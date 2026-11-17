@@ -259,4 +259,110 @@ test('Version comparison orders patch releases', () => {
   assert.equal(api.compareVersions('2.1.1', '2.1.1'), 0);
 });
 
+// ---- v3.0.0 tests ----
+
+test('Fertile window looks ahead once this cycle\'s window has passed', () => {
+  const s = structuredClone(api.defaultState);
+  s.settings.typicalCycleLength = 28;
+  const start = relDay(-26);
+  s.settings.recentPeriodStart = start;
+  s.logs = { [start]: dayLog(start, 'medium') };
+  api.setState(s);
+  const c = api.cycleData();
+  const fw = api.fertileWindow(c);
+  assert.equal(fw.next, true);
+  assert(fw.end >= relDay(0), 'window shown must not be in the past');
+  assert.equal(fw.ovulation, api.addDays(c.ovulation, c.predictedLength));
+});
+
+test('Fertile window stays on the current cycle before it ends', () => {
+  const s = structuredClone(api.defaultState);
+  const start = relDay(-8);
+  s.settings.recentPeriodStart = start;
+  s.logs = { [start]: dayLog(start, 'medium') };
+  api.setState(s);
+  const c = api.cycleData();
+  const fw = api.fertileWindow(c);
+  assert.equal(fw.next, false);
+  assert.equal(fw.ovulation, c.ovulation);
+});
+
+test('Calendar projects the next three periods a cycle apart', () => {
+  const s = structuredClone(api.defaultState);
+  const start = relDay(-10);
+  s.settings.recentPeriodStart = start;
+  s.logs = { [start]: dayLog(start, 'medium') };
+  api.setState(s);
+  const c = api.cycleData();
+  const p = api.projectedCycles(c, 3);
+  assert.equal(p.length, 3);
+  assert.equal(p[0].start, c.predictedStart);
+  assert.equal(api.daysBetween(p[0].start, p[1].start), c.predictedLength);
+  assert.equal(p[2].ovulation, api.addDays(p[2].start, -14));
+});
+
+test('Calendar fertile shading follows the setting and skips past cycles', () => {
+  const s = structuredClone(api.defaultState);
+  const start = relDay(-3);
+  s.settings.recentPeriodStart = start;
+  s.logs = { [start]: dayLog(start, 'medium') };
+  s.settings.showFertileWindow = false;
+  api.setState(s);
+  let c = api.cycleData();
+  assert.equal(api.calendarMarks().isFertile(c.ovulation), false);
+  s.settings.showFertileWindow = true;
+  api.setState(s);
+  c = api.cycleData();
+  const marks = api.calendarMarks();
+  assert.equal(marks.isFertile(c.ovulation), true);
+  assert.equal(marks.isFertile(api.addDays(start, -20)), false);
+  assert.equal(marks.isPredicted(c.predictedStart), true);
+});
+
+test('Ring segments follow period length and ovulation in order', () => {
+  const s = structuredClone(api.defaultState);
+  const start = relDay(-5);
+  s.settings.recentPeriodStart = start;
+  s.settings.typicalCycleLength = 28;
+  s.logs = { [start]: dayLog(start, 'medium') };
+  api.setState(s);
+  const seg = api.ringSegments(api.cycleData(), 5);
+  assert.equal(seg.menstrual, Math.round(5 / 28 * 1000) / 10);
+  assert(seg.menstrual <= seg.ovStart && seg.ovStart <= seg.ovEnd && seg.ovEnd <= 100);
+  const short = api.ringSegments({ ...api.cycleData(), predictedLength: 10, ovulation: api.addDays(start, 2) }, 7);
+  assert(short.ovStart >= short.menstrual, 'segments never overlap on short cycles');
+});
+
+test('Upgrading users with completed cycles are not shown the first-cycle celebration', () => {
+  const s = structuredClone(api.defaultState);
+  s.logs = {};
+  [-60, -32].forEach(n => { for (let i = 0; i < 4; i++) { const d = relDay(n + i); s.logs[d] = dayLog(d, 'medium'); } });
+  s.notifications.celebratedFirstCycle = false;
+  api.setState(s);
+  api.migrateState('2.1.1');
+  assert.equal(api.getState().notifications.celebratedFirstCycle, true);
+});
+
+test('New users keep the first-cycle celebration available', () => {
+  const s = structuredClone(api.defaultState);
+  const d = relDay(-5);
+  s.logs = { [d]: dayLog(d, 'medium') };
+  api.setState(s);
+  api.migrateState('2.1.1');
+  assert.equal(api.getState().notifications.celebratedFirstCycle, false);
+});
+
+test('Backup reminder snoozes for a week', () => {
+  const s = structuredClone(api.defaultState);
+  s.onboardingComplete = true;
+  api.setState(s);
+  const backup = api.buildNotifications().find(n => n.type === 'backup');
+  assert.equal(backup.actions.find(a => !a.primary).days, 7);
+});
+
+test('Labels use sentence case', () => {
+  assert.equal(api.sentenceCase('breast tenderness'), 'Breast tenderness');
+  assert.equal(api.sentenceCase('egg-white'), 'Egg-white');
+});
+
 console.log(`\n${passed} core tests passed.`);
