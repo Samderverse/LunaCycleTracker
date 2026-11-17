@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '2.1.1';
+const APP_VERSION = '3.0.0';
 const DB_NAME = 'lunaDailyDB';
 const STORE = 'appState';
 const PERIOD_BLEEDING = ['light','medium','heavy'];
@@ -8,7 +8,8 @@ const PERIOD_BLEEDING = ['light','medium','heavy'];
 const MAX_PERIOD_GAP_DAYS = 2;
 const UPDATE_NOTES = {
   '2.1.0': 'In-app reminders have been added for daily logging, cycle timing, backups, cycle summaries and personal symptom patterns.',
-  '2.1.1': 'Fixes: light, medium and heavy bleeding now count as a period automatically, a missed day no longer splits a period in two, and backups save through the iPhone share sheet.'
+  '2.1.1': 'Fixes: light, medium and heavy bleeding now count as a period automatically, a missed day no longer splits a period in two, and backups save through the iPhone share sheet.',
+  '3.0.0': 'A fresh look: your cycle comes first on Today, the daily log is shorter, the calendar shows upcoming periods and fertile days, and Insights highlights your usual range.'
 };
 const $ = (s, root=document) => root.querySelector(s);
 const $$ = (s, root=document) => [...root.querySelectorAll(s)];
@@ -25,7 +26,7 @@ const defaultState = {
     privacyCurtain: true, lastBackupAt: null, inAppNotifications: true
   },
   logs: {}, periods: [], excludedCycleStarts: [],
-  notifications: { dismissed: {}, seenCycleSummaries: [], lastSeenAppVersion: APP_VERSION, updatedFromVersion: null }
+  notifications: { dismissed: {}, seenCycleSummaries: [], lastSeenAppVersion: APP_VERSION, updatedFromVersion: null, celebratedFirstCycle: false }
 };
 
 let state = structuredClone(defaultState);
@@ -36,6 +37,7 @@ let db;
 let storageMode = 'indexeddb';
 let renderedOn = null;
 let pendingBackup = null;
+let suppressDayTap = false;
 
 function openDB(){
   return new Promise((resolve,reject)=>{
@@ -109,6 +111,11 @@ function migrateState(fromVersion){
     });
   }
   rebuildPeriods();
+  if(!fromVersion||fromVersion==='unknown'||compareVersions(fromVersion,'3.0.0')<0){
+    // Anyone upgrading with a completed cycle already has one: don't greet them with a first-cycle celebration.
+    state.notifications=state.notifications||{};
+    if(cycleData().lengths.length)state.notifications.celebratedFirstCycle=true;
+  }
 }
 function cycleData(){
   rebuildPeriods();
@@ -142,6 +149,35 @@ function cycleData(){
   return {starts,lengths,latestStart,predictedLength:Math.round(predictedLength),predictedStart,earliest:addDays(predictedStart,-allowance),latest:addDays(predictedStart,allowance),allowance,cycleDay,phase,label,ovulation};
 }
 
+// The estimated fertile window for this cycle, or for the next cycle once this one's has passed.
+function fertileWindow(c,today=todayISO()){
+  let ovulation=c.ovulation,next=false;
+  if(today>addDays(ovulation,1)){ovulation=addDays(ovulation,c.predictedLength);next=true}
+  return {start:addDays(ovulation,-5),end:addDays(ovulation,1),ovulation,next};
+}
+// Estimated starts and ovulation days for the next few cycles, for the calendar.
+function projectedCycles(c,count=3){
+  return Array.from({length:count},(_,i)=>{const start=addDays(c.predictedStart,i*c.predictedLength);return {start,ovulation:addDays(start,-14)}});
+}
+// Ring segments sized to this person's own period length and estimated ovulation, rather than fixed proportions.
+function ringSegments(c,periodLength=averagePeriodLength()){
+  const L=Math.max(1,c.predictedLength),pct=d=>Math.round(clamp(d/L*100,0,100)*10)/10;
+  const ovDay=daysBetween(c.latestStart,c.ovulation);
+  const menstrual=pct(periodLength),ovStart=Math.max(menstrual,pct(ovDay-2)),ovEnd=Math.max(ovStart,pct(ovDay+2));
+  return {menstrual,ovStart,ovEnd};
+}
+function lastPeriod(){rebuildPeriods();return state.periods.at(-1)||null}
+function sentenceCase(s){s=String(s||'');return s.charAt(0).toUpperCase()+s.slice(1)}
+// A light tap on supported phones. Android uses the vibration API; iOS 18+ Safari ticks when a switch input is toggled.
+let hapticLabel=null;
+function haptic(){
+  try{
+    if(navigator.vibrate){navigator.vibrate(12);return}
+    if(!hapticLabel){hapticLabel=document.createElement('label');hapticLabel.setAttribute('aria-hidden','true');hapticLabel.style.display='none';const input=document.createElement('input');input.type='checkbox';input.setAttribute('switch','');hapticLabel.append(input);document.body.append(hapticLabel)}
+    hapticLabel.click();
+  }catch(e){}
+}
+
 function toast(msg){const el=$('#toast');el.textContent=msg;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),2400)}
 function setTheme(){document.body.classList.toggle('light',state.settings.theme==='light'||(state.settings.theme==='system'&&matchMedia('(prefers-color-scheme:light)').matches))}
 function setHeader(){const titles={today:'Today',calendar:'Calendar',insights:'Insights',settings:'Settings'};$('#screenTitle').textContent=titles[route];const h=new Date().getHours();$('#greeting').textContent=h<12?'Good morning':h<18?'Good afternoon':'Good evening'}
@@ -162,32 +198,37 @@ function renderOnboarding(){
 }
 function installCard(){
   const standalone=matchMedia('(display-mode: standalone)').matches||navigator.standalone;
-  return standalone?'':`<div class="card"><p class="eyebrow">Recommended on iPhone</p><h3>Install before entering real data</h3><p class="install-note">In Safari, tap Share, choose <b>Add to Home Screen</b>, enable <b>Open as Web App</b>, then launch Luna Daily from its icon.</p></div>`;
+  return standalone?'':`<details class="install-banner"><summary><span aria-hidden="true">⊕</span><b>Add Luna Daily to your Home Screen</b><i>How</i></summary><p>Do this before entering real data. In Safari, tap Share, choose <b>Add to Home Screen</b>, turn on <b>Open as Web App</b>, then open Luna Daily from its icon.</p></details>`;
 }
 function renderToday(){
   $('.bottom-nav').style.display='grid';$('#quickBackupBtn').style.visibility='visible';
-  const c=cycleData(), log=state.logs[todayISO()];
-  const until=daysBetween(todayISO(),c.predictedStart);
+  const c=cycleData(), today=todayISO(), log=state.logs[today];
+  const until=daysBetween(today,c.predictedStart);
+  const inPeriod=c.phase.includes('Menstrual');
   const timing=until>=0?`${until} day${until===1?'':'s'} until the central estimate`:`${Math.abs(until)} day${Math.abs(until)===1?'':'s'} beyond the central estimate`;
+  const statusPill=inPeriod?'':until<0?`<span class="status-pill period">${Math.abs(until)} day${Math.abs(until)===1?'':'s'} past estimate</span>`:until<=3?`<span class="status-pill period">Period due soon</span>`:'';
   const progress=clamp(((c.cycleDay-1)/Math.max(1,c.predictedLength))*100,0,100);
+  const seg=ringSegments(c);
+  const last=lastPeriod();
+  const lastLength=last&&last.lengthKnown?daysBetween(last.startDate,last.endDate)+1:null;
   $('#mainContent').innerHTML=`
     ${installCard()}
-    ${notificationCentre()}
     <section class="card hero-card">
       <div class="aurora aurora-one"></div><div class="aurora aurora-two"></div>
-      <span class="phase-pill">${c.phase}</span>
-      <div class="dashboard-columns" style="margin-top:18px">
+      <div class="pill-row"><span class="phase-pill">${c.phase}</span>${statusPill}</div>
+      <div class="dashboard-columns hero-layout">
         <div class="hero-copy"><div class="big-number">Day ${c.cycleDay}</div><p class="muted">${timing}</p><p><b>Expected around ${fmtDate(c.predictedStart,{day:'numeric',month:'long'})}</b><br><span class="muted">Likely range ${fmtDate(c.earliest,{day:'numeric',month:'short'})}–${fmtDate(c.latest,{day:'numeric',month:'short'})} · ${c.label}</span></p></div>
-        <div class="cycle-ring" style="--cycle-progress:${progress}deg;--marker-turn:${progress*3.6}deg"><span class="cycle-marker" aria-hidden="true"></span><div class="cycle-ring-inner"><b>${c.cycleDay}</b><span>cycle day</span></div></div>
+        <div class="cycle-ring" style="--seg-m:${seg.menstrual}%;--seg-os:${seg.ovStart}%;--seg-oe:${seg.ovEnd}%;--marker-turn:${progress*3.6}deg" role="img" aria-label="Day ${c.cycleDay} of about ${c.predictedLength}"><span class="cycle-marker" aria-hidden="true"></span><div class="cycle-ring-inner"><b>${c.cycleDay}</b><span>of ~${c.predictedLength}</span></div></div>
       </div>
-      <button class="primary-button" data-action="log-date" data-date="${todayISO()}">${log?'Edit today’s log':'Log today'}</button>
+      <button class="primary-button" data-action="log-date" data-date="${today}">${log?'Edit today’s log':'Log today'}</button>
     </section>
+    ${notificationCentre()}
     ${log?dailySummary(log):''}
     <div class="section-heading"><h2>Your cycle now</h2><p>Calendar estimate</p></div>
     ${phaseJourney(c)}
     <div class="grid-2">
-      <div class="metric"><span class="muted">Typical cycle</span><strong>${c.predictedLength} days</strong></div>
-      <div class="metric"><span class="muted">Typical period</span><strong>${averagePeriodLength()} days</strong></div>
+      <div class="metric"><span class="muted">Last period</span><strong>${last?fmtDate(last.startDate,{day:'numeric',month:'short'}):'—'}</strong><small class="muted">${last?(lastLength?`${lastLength} day${lastLength===1?'':'s'}${last.status==='current'?' so far':''}`:'Length not logged'):'Not logged yet'}</small></div>
+      <div class="metric"><span class="muted">Usual cycle</span><strong>${c.predictedLength} days</strong><small class="muted">Period ${averagePeriodLength()} days</small></div>
     </div>
     <div class="section-heading"><h2>About this phase</h2></div>
     <section class="card phase-guidance"><div class="phase-symbol">${phaseSymbol(c.phase)}</div><div><h3>${cleanPhaseName(c.phase)}</h3><p>${phaseGuidance(c.phase)}</p><p class="muted phase-note">General educational information only. The app estimates phases from dates and cannot confirm ovulation or hormone levels.</p></div></section>
@@ -200,14 +241,14 @@ function phaseJourney(c){
   const phases=[
     {key:'Menstrual',name:'Menstrual',detail:'Recorded bleeding days',symbol:'●'},
     {key:'Follicular',name:'Follicular',detail:'After the period',symbol:'◒'},
-    {key:'Ovulation',name:'Ovulation',detail:`Estimated near ${fmtDate(c.ovulation,{day:'numeric',month:'short'})}`,symbol:'✦'},
+    {key:'Ovulation',name:'Ovulation',detail:`Estimated near ${fmtDate(fertileWindow(c).ovulation,{day:'numeric',month:'short'})}`,symbol:'✦'},
     {key:'Luteal',name:'Luteal',detail:'Before the next period',symbol:'◕'}
   ];
-  return `<section class="card phase-journey"><div class="phase-track" aria-label="Estimated cycle phases">${phases.map((p,i)=>{const active=c.phase.includes(p.key);return `<div class="phase-step ${active?'active':''}"><div class="phase-dot"><span>${p.symbol}</span></div><b>${p.name}</b><small>${p.detail}</small></div>${i<phases.length-1?'<div class="phase-connector"></div>':''}`}).join('')}</div>${state.settings.showFertileWindow?`<div class="fertile-note"><span>✦</span><p><b>Estimated fertile window</b><br><span class="muted">Approximately ${fmtDate(addDays(c.ovulation,-5),{day:'numeric',month:'short'})}–${fmtDate(addDays(c.ovulation,1),{day:'numeric',month:'short'})}. This cannot confirm fertility and should not be used as contraception.</span></p></div>`:''}</section>`
+  return `<section class="card phase-journey"><div class="phase-track" aria-label="Estimated cycle phases">${phases.map((p,i)=>{const active=c.phase.includes(p.key);return `<div class="phase-step ${active?'active':''}"><div class="phase-dot"><span>${p.symbol}</span></div><b>${p.name}</b><small>${p.detail}</small></div>${i<phases.length-1?'<div class="phase-connector"></div>':''}`}).join('')}</div>${state.settings.showFertileWindow?(()=>{const fw=fertileWindow(c);return `<div class="fertile-note"><span>✦</span><p><b>${fw.next?'Next estimated fertile window':'Estimated fertile window'}</b><br><span class="muted">Approximately ${fmtDate(fw.start,{day:'numeric',month:'short'})}–${fmtDate(fw.end,{day:'numeric',month:'short'})}. This cannot confirm fertility and should not be used as contraception.</span></p></div>`})():''}</section>`
 }
 
 function dailySummary(log){
-  const items=[];if(log.bleeding&&log.bleeding!=='none')items.push(['Bleeding',capitalize(log.bleeding)]);if(log.symptoms?.length)items.push(['Symptoms',log.symptoms.map(s=>capitalize(s.name)).join(', ')]);if(log.moods?.length)items.push(['Mood',log.moods.map(capitalize).join(', ')]);if(log.energy)items.push(['Energy',['','Very low','Low','Average','High','Very high'][log.energy]]);
+  const items=[];if(log.bleeding&&log.bleeding!=='none')items.push(['Bleeding',capitalize(log.bleeding)]);if(log.symptoms?.length)items.push(['Symptoms',log.symptoms.map(s=>sentenceCase(s.name)).join(', ')]);if(log.moods?.length)items.push(['Mood',log.moods.map(sentenceCase).join(', ')]);if(log.energy)items.push(['Energy',['','Very low','Low','Average','High','Very high'][log.energy]]);
   return `<div class="section-heading"><h2>Today</h2></div><section class="card summary-list">${items.length?items.map(([a,b])=>`<div class="summary-row"><span class="muted">${a}</span><b>${b}</b></div>`).join(''):'<p class="muted">A note was saved for today.</p>'}</section>`;
 }
 function phaseGuidance(phase){if(phase.includes('Menstrual'))return 'Energy and comfort can vary during bleeding days. Rest, hydration and the relief methods that usually work for you may be helpful.';if(phase.includes('Ovulation'))return 'This is a calendar-based phase estimate. Some people notice changes in discharge, energy or libido, but the app cannot confirm ovulation.';if(phase.includes('Luteal'))return 'Some people notice shifts in energy, appetite, sleep or mood later in the cycle. Patterns become clearer through regular logging.';return 'Energy and wellbeing may change throughout this part of the cycle. Logging only what feels useful is enough.'}
@@ -218,13 +259,18 @@ function isNotificationDismissed(key){
   if(until==='forever')return true;
   return todayISO()<=until;
 }
+// Compact reminder: one line with a single action. Informational notices (updates, summaries, patterns) keep their text.
+const DETAILED_NOTICES=['update','summary','insight'];
 function notificationCard(n){
-  return `<article class="notice-card notice-${n.type}" data-notice-key="${escapeHTML(n.key)}">
+  const primary=n.actions.find(a=>a.primary);
+  const secondary=n.actions.find(a=>!a.primary);
+  const close=n.dismissible?{action:'dismiss-notice',key:n.key,days:n.dismissDays,label:'Dismiss'}:secondary;
+  const detailed=DETAILED_NOTICES.includes(n.type);
+  const attrs=a=>`data-action="${a.action}" ${a.date?`data-date="${a.date}"`:''} ${a.key?`data-key="${escapeHTML(a.key)}"`:''} ${a.days!=null&&a.days!==''?`data-days="${a.days}"`:''}`;
+  return `<article class="notice-card notice-${n.type} ${detailed?'notice-detailed':''}" data-notice-key="${escapeHTML(n.key)}">
     <div class="notice-icon" aria-hidden="true">${n.icon}</div>
-    <div class="notice-copy"><p class="eyebrow">${n.eyebrow}</p><h3>${n.title}</h3><p>${n.body}</p>${n.meta?`<div class="notice-meta">${n.meta}</div>`:''}
-      <div class="notice-actions">${n.actions.map(a=>`<button class="${a.primary?'primary-button':'text-button'}" data-action="${a.action}" ${a.date?`data-date="${a.date}"`:''} ${a.key?`data-key="${escapeHTML(a.key)}"`:''}>${a.label}</button>`).join('')}</div>
-    </div>
-    ${n.dismissible?`<button class="notice-dismiss" data-action="dismiss-notice" data-key="${escapeHTML(n.key)}" data-days="${n.dismissDays??''}" aria-label="Dismiss notification">×</button>`:''}
+    <div class="notice-copy"><p class="eyebrow">${n.eyebrow}</p><h3>${n.title}</h3>${detailed?`<p>${n.body}</p>`:''}${detailed&&n.meta?`<div class="notice-meta">${n.meta}</div>`:''}</div>
+    <div class="notice-side">${primary?`<button class="pill-button" ${attrs(primary)}>${primary.label}</button>`:''}${close?`<button class="notice-dismiss" ${attrs(close)} aria-label="${escapeHTML(close.label)}" title="${escapeHTML(close.label)}">×</button>`:''}</div>
   </article>`;
 }
 function endCycleSummaryNotice(c){
@@ -287,30 +333,70 @@ function buildNotifications(){
   if(backupAge===null||backupAge>=30){
     const bucket=backupAge===null?'first':Math.floor(backupAge/7);
     const key=notificationKey('backup',bucket);
-    if(!isNotificationDismissed(key))notices.push({type:'backup',key,icon:'⇩',eyebrow:'Protect your history',title:backupAge===null?'Create your first backup':`Your last backup was ${backupAge} days ago`,body:'An encrypted backup can protect your entries if browser or app data is removed.',actions:[{label:'Create backup',action:'export-backup',primary:true},{label:'Remind me next week',action:'dismiss-notice',key}],dismissible:false});
+    if(!isNotificationDismissed(key))notices.push({type:'backup',key,icon:'⇩',eyebrow:'Protect your history',title:backupAge===null?'Create your first backup':`Your last backup was ${backupAge} days ago`,body:'An encrypted backup can protect your entries if browser or app data is removed.',actions:[{label:'Create backup',action:'export-backup',primary:true},{label:'Remind me next week',action:'dismiss-notice',key,days:7}],dismissible:false});
   }
   const summary=endCycleSummaryNotice(c);if(summary)notices.push(summary);
   const insight=symptomInsightNotice(c);if(insight)notices.push(insight);
   return notices;
 }
 function notificationCentre(){
-  const notices=buildNotifications();if(!notices.length)return '';
-  return `<section class="notice-centre"><div class="section-heading notice-heading"><h2>For you today</h2><p>${notices.length} reminder${notices.length===1?'':'s'}</p></div><div class="notice-stack">${notices.map(notificationCard).join('')}</div></section>`;
+  // The period estimate is shown in the main card, so it isn't repeated as a reminder on Today.
+  const notices=buildNotifications().filter(n=>n.type!=='period');if(!notices.length)return '';
+  return `<section class="notice-centre" aria-label="Reminders"><div class="notice-stack">${notices.map(notificationCard).join('')}</div></section>`;
 }
 function averagePeriodLength(){rebuildPeriods();const complete=state.periods.filter(p=>p.status==='complete'&&p.lengthKnown);return complete.length?Math.round(mean(complete.map(p=>daysBetween(p.startDate,p.endDate)+1))):state.settings.typicalPeriodLength}
 
+function changeMonth(step){
+  calendarCursor=new Date(calendarCursor.getFullYear(),calendarCursor.getMonth()+step,1);
+  renderCalendar();
+  const grid=$('.calendar-grid');if(grid){grid.classList.add(step>0?'slide-next':'slide-prev')}
+}
+function calendarMarks(){
+  const c=cycleData(),periodDays=averagePeriodLength(),cycles=projectedCycles(c,3);
+  const showFertile=state.settings.showFertileWindow;
+  return {c,
+    isPredicted:iso=>cycles.some(p=>iso>=p.start&&iso<addDays(p.start,periodDays)),
+    // Fertile shading only from the current cycle onwards; past estimates aren't useful.
+    ovulations:[c.ovulation,...cycles.slice(1).map(p=>p.ovulation)],
+    isFertile:iso=>showFertile&&iso>=c.latestStart&&[c.ovulation,...cycles.slice(1).map(p=>p.ovulation)].some(o=>iso>=addDays(o,-5)&&iso<=addDays(o,1))};
+}
 function renderCalendar(){
-  const y=calendarCursor.getFullYear(),m=calendarCursor.getMonth();const first=new Date(y,m,1);const gridStart=new Date(y,m,1-((first.getDay()+6)%7));const c=cycleData();const predictedDays=averagePeriodLength();
-  let days='';for(let i=0;i<42;i++){const d=new Date(gridStart);d.setDate(gridStart.getDate()+i);const iso=dateToISO(d);const log=state.logs[iso];const confirmed=state.periods.some(p=>iso>=p.startDate&&iso<=p.endDate);const predicted=iso>=c.predictedStart&&iso<addDays(c.predictedStart,predictedDays);days+=`<button class="day ${d.getMonth()!==m?'other':''} ${iso===todayISO()?'today':''} ${confirmed?'period':''} ${predicted&&!confirmed?'predicted':''} ${log?'has-log':''} ${iso===selectedCalendarDate?'selected':''}" data-action="select-day" data-date="${iso}" aria-label="${fmtDate(iso)}${confirmed?', period logged':''}${log?', entry saved':''}">${d.getDate()}</button>`}
+  const y=calendarCursor.getFullYear(),m=calendarCursor.getMonth();const first=new Date(y,m,1);const gridStart=new Date(y,m,1-((first.getDay()+6)%7));
+  const marks=calendarMarks(),today=todayISO(),ovulations=marks.ovulations;
+  let days='';
+  for(let i=0;i<42;i++){
+    const d=new Date(gridStart);d.setDate(gridStart.getDate()+i);const iso=dateToISO(d);const log=state.logs[iso];
+    const confirmed=state.periods.some(p=>iso>=p.startDate&&iso<=p.endDate);
+    const predicted=!confirmed&&marks.isPredicted(iso);
+    const fertile=!confirmed&&marks.isFertile(iso);
+    const ovulation=fertile&&ovulations.includes(iso);
+    const labels=[fmtDate(iso),iso===today&&'today',confirmed&&'period logged',predicted&&'predicted period',ovulation?'estimated ovulation':fertile&&'estimated fertile window',log&&'entry saved'].filter(Boolean).join(', ');
+    days+=`<button class="day ${d.getMonth()!==m?'other':''} ${iso===today?'today':''} ${confirmed?'period':''} ${predicted?'predicted':''} ${fertile?'fertile':''} ${ovulation?'ovulation':''} ${log?'has-log':''} ${iso===selectedCalendarDate?'selected':''}" data-action="select-day" data-date="${iso}" aria-label="${labels}" ${iso===selectedCalendarDate?'aria-current="date"':''}>${d.getDate()}</button>`;
+  }
   const selected=state.logs[selectedCalendarDate];
-  $('#mainContent').innerHTML=`<section class="card"><div class="calendar-head"><button data-action="month-prev" aria-label="Previous month">‹</button><h2>${calendarCursor.toLocaleDateString('en-GB',{month:'long',year:'numeric'})}</h2><button data-action="month-next" aria-label="Next month">›</button></div><div class="calendar-grid">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(x=>`<div class="weekday">${x}</div>`).join('')}${days}</div><div class="calendar-legend"><span><i class="legend-dot confirmed"></i>Logged period</span><span><i class="legend-dot predicted"></i>Predicted period</span><span>• Daily entry</span></div></section><section class="card"><p class="eyebrow">${fmtDate(selectedCalendarDate,{weekday:'long',day:'numeric',month:'long'})}</p>${selected?dailySummary(selected).replace('<section class="card summary-list">','<div class="summary-list">').replace('</section>','</div>'):'<p class="muted">Nothing logged for this day.</p>'}<button class="primary-button" data-action="log-date" data-date="${selectedCalendarDate}">${selected?'Edit entry':'Log this day'}</button></section>`;
+  const isCurrentMonth=y===new Date().getFullYear()&&m===new Date().getMonth();
+  $('#mainContent').innerHTML=`<section class="card calendar-card"><div class="calendar-head"><button data-action="month-prev" aria-label="Previous month">‹</button><div class="calendar-title"><h2>${calendarCursor.toLocaleDateString('en-GB',{month:'long',year:'numeric'})}</h2>${isCurrentMonth?'<span class="muted">Swipe to change month</span>':'<button class="text-button" data-action="calendar-today">Back to today</button>'}</div><button data-action="month-next" aria-label="Next month">›</button></div><div class="calendar-grid">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(x=>`<div class="weekday" aria-hidden="true">${x}</div>`).join('')}${days}</div><div class="calendar-legend"><span><i class="legend-dot confirmed"></i>Period</span><span><i class="legend-dot predicted"></i>Predicted</span>${state.settings.showFertileWindow?'<span><i class="legend-dot fertile"></i>Fertile estimate</span><span><i class="legend-star">✦</i>Ovulation estimate</span>':''}<span><i class="legend-entry"></i>Entry</span></div></section><section class="card"><p class="eyebrow">${fmtDate(selectedCalendarDate,{weekday:'long',day:'numeric',month:'long'})}</p>${selected?dailySummary(selected).replace('<section class="card summary-list">','<div class="summary-list">').replace('</section>','</div>').replace(/<div class="section-heading">.*?<\/div>/,''):'<p class="muted">Nothing logged for this day.</p>'}<button class="primary-button" data-action="log-date" data-date="${selectedCalendarDate}">${selected?'Edit entry':'Log this day'}</button></section>`;
 }
 
 function renderInsights(){
-  const c=cycleData();const vals=c.lengths.slice(-6);const max=Math.max(35,...vals.map(x=>x.length));
-  const chart=vals.length?`<div class="bar-chart">${vals.map(x=>`<div class="bar-wrap"><b>${x.length}</b><div class="bar" style="height:${Math.max(12,x.length/max*125)}px"></div><small>${fmtDate(x.start,{day:'numeric',month:'short'})}</small></div>`).join('')}</div>`:`<div class="empty">Cycle charts will appear after two period start dates have been logged.</div>`;
-  const symptoms=symptomCounts();
-  $('#mainContent').innerHTML=`<div class="grid-2"><div class="metric"><span class="muted">Average cycle</span><strong>${c.lengths.length?Math.round(mean(c.lengths.map(x=>x.length))):'—'}</strong><span class="muted">days</span></div><div class="metric"><span class="muted">Completed cycles</span><strong>${c.lengths.length}</strong></div><div class="metric"><span class="muted">Shortest</span><strong>${c.lengths.length?Math.min(...c.lengths.map(x=>x.length)):'—'}</strong><span class="muted">days</span></div><div class="metric"><span class="muted">Longest</span><strong>${c.lengths.length?Math.max(...c.lengths.map(x=>x.length)):'—'}</strong><span class="muted">days</span></div></div><div class="section-heading"><h2>Recent cycle lengths</h2></div><section class="card">${chart}</section><div class="section-heading"><h2>Commonly logged</h2></div><section class="card">${symptoms.length?symptoms.slice(0,5).map(([name,count])=>`<div class="summary-row"><span>${capitalize(name)}</span><b>${count} day${count===1?'':'s'}</b></div>`).join(''):'<div class="empty">Symptom patterns will appear as you add daily entries.</div>'}</section><section class="card warning">Insights describe your own records only. They do not diagnose a condition or prove a hormonal cause.</section>`;
+  const c=cycleData();const vals=c.lengths.slice(-6);
+  const lo=c.predictedLength-c.allowance,hi=c.predictedLength+c.allowance,plot=120;
+  // A zoomed-in scale shows a few days' difference clearly. Dots rather than bars, so it doesn't imply a zero baseline.
+  const floor=Math.min(lo,...vals.map(x=>x.length))-3,ceil=Math.max(hi,...vals.map(x=>x.length))+3;
+  const y=v=>Math.round((v-floor)/(ceil-floor)*plot);
+  const chart=vals.length?`<div class="dot-chart" style="--plot:${plot}px">
+      <div class="dot-plot"><div class="usual-band" style="bottom:${y(lo)}px;height:${y(hi)-y(lo)}px" aria-hidden="true"></div>
+        ${vals.map(x=>{const unusual=x.length<lo||x.length>hi;return `<button class="dot-col" data-action="open-month" data-date="${x.start}" aria-label="Cycle starting ${fmtDate(x.start)}: ${x.length} days${unusual?', outside your usual range':''}. Open in calendar"><span class="dot ${unusual?'unusual':''}" style="bottom:${y(x.length)}px"><b>${x.length}</b></span></button>`}).join('')}
+      </div>
+      <div class="bar-dates">${vals.map(x=>`<small>${fmtDate(x.start,{day:'numeric',month:'short'})}</small>`).join('')}</div>
+    </div>
+    <p class="chart-note"><i class="band-key"></i>Your usual range: ${lo}–${hi} days. Tap a cycle to see it on the calendar.</p>`:`<div class="empty">Cycle charts will appear after two period start dates have been logged.</div>`;
+  const symptoms=symptomCounts().slice(0,6),topCount=symptoms[0]?.[1]||1;
+  const avg=c.lengths.length?Math.round(mean(c.lengths.map(x=>x.length))):null;
+  $('#mainContent').innerHTML=`<div class="grid-2"><div class="metric"><span class="muted">Average cycle</span><strong>${avg??'—'}</strong><small class="muted">${avg?'days':'Needs two periods'}</small></div><div class="metric"><span class="muted">Completed cycles</span><strong>${c.lengths.length}</strong><small class="muted">${c.label}</small></div><div class="metric"><span class="muted">Shortest</span><strong>${c.lengths.length?Math.min(...c.lengths.map(x=>x.length)):'—'}</strong><small class="muted">days</small></div><div class="metric"><span class="muted">Longest</span><strong>${c.lengths.length?Math.max(...c.lengths.map(x=>x.length)):'—'}</strong><small class="muted">days</small></div></div>
+  <div class="section-heading"><h2>Recent cycle lengths</h2></div><section class="card">${chart}</section>
+  <div class="section-heading"><h2>Commonly logged</h2><p>All time</p></div><section class="card">${symptoms.length?`<div class="symptom-bars">${symptoms.map(([name,count])=>`<div class="symptom-row"><span>${sentenceCase(name)}</span><b>${count} day${count===1?'':'s'}</b><i style="--w:${Math.round(count/topCount*100)}%"></i></div>`).join('')}</div>`:'<div class="empty">Symptom patterns will appear as you add daily entries.</div>'}</section>
+  <section class="card warning">Insights describe your own records only. They do not diagnose a condition or prove a hormonal cause.</section>`;
 }
 function symptomCounts(){const counts={};Object.values(state.logs).forEach(l=>(l.symptoms||[]).forEach(s=>counts[s.name]=(counts[s.name]||0)+1));return Object.entries(counts).sort((a,b)=>b[1]-a[1])}
 
@@ -343,21 +429,40 @@ function closeModal(){
 function syncChipState(root){$$('.chips .chip',root).forEach(chip=>chip.setAttribute('aria-pressed',String(chip.classList.contains('selected')||chip.classList.contains('period-selected'))))}
 function onboardingModal(){showModal(`<div class="modal-head"><h2>Set up your cycle</h2><button class="close-button" data-action="close-modal">×</button></div><form id="onboardingForm"><div class="field"><label for="recentStart">First day of your most recent period</label><input class="input" id="recentStart" name="recentStart" type="date" max="${todayISO()}" value="${state.settings.recentPeriodStart}" required></div><div class="field"><label>Typical cycle length</label><div class="chips" data-single="cycleLength">${[24,26,28,30,32,35].map(v=>`<button type="button" class="chip ${v===28?'selected':''}" data-value="${v}">${v} days</button>`).join('')}</div><input type="hidden" name="cycleLength" value="28"></div><div class="field"><label>Typical period length</label><div class="chips" data-single="periodLength">${[3,4,5,6,7].map(v=>`<button type="button" class="chip ${v===5?'selected':''}" data-value="${v}">${v} days</button>`).join('')}</div><input type="hidden" name="periodLength" value="5"></div><label class="toggle-row"><span>I understand that deleting browser or app data may remove my entries.</span><input type="checkbox" name="ack" required></label><button class="primary-button" type="submit">Create my tracker</button></form>`)}
 
+function chipField(label,kind,name,options,isSelected,{hidden=true,selectedClass='selected',labelOf=sentenceCase}={}){
+  const value=options.find(isSelected);
+  return `<div class="field"><label>${label}</label><div class="chips" data-${kind}="${name}">${options.map(v=>`<button type="button" class="chip ${isSelected(v)?selectedClass:''}" data-value="${v}">${labelOf(v)}</button>`).join('')}</div>${kind==='single'&&hidden?`<input type="hidden" name="${name}" value="${value??''}">`:''}</div>`;
+}
 function logModal(date){
   const l=state.logs[date]||{date,bleeding:'none',countsAsPeriod:false,symptoms:[],moods:[],energy:null,sleepHours:'',sleepQuality:'',cervicalFluid:null,sexualActivity:[],pregnancyTest:null,ovulationTest:null,medication:'',notes:''};
   const bleed=['none','spotting','light','medium','heavy'];const symptoms=['cramps','bloating','headache','migraine','breast tenderness','back pain','pelvic pain','nausea','digestive changes','acne','cravings','fatigue','dizziness','hot flushes'];const moods=['calm','happy','confident','sociable','focused','sensitive','anxious','irritable','low','overwhelmed','tearful','emotionally flat'];
-  showModal(`<div class="modal-head"><div><p class="eyebrow">Daily log</p><h2>${fmtDate(date,{weekday:'long',day:'numeric',month:'long'})}</h2></div><button class="close-button" data-action="close-modal">×</button></div><form id="logForm" data-date="${date}">
-  <div class="field"><label>Bleeding</label><div class="chips" data-single="bleeding">${bleed.map(v=>`<button type="button" class="chip ${l.bleeding===v?'period-selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="bleeding" value="${l.bleeding}"></div>
-  <div class="field"><label class="toggle-row"><span>Count this as part of a period</span><input type="checkbox" name="countsAsPeriod" ${l.countsAsPeriod?'checked':''}></label><small>Ticked automatically for light, medium or heavy bleeding. Spotting won’t start a new cycle unless you tick this.</small></div>
-  <div class="field"><label>Physical symptoms</label><div class="chips" data-multi="symptoms">${symptoms.map(v=>`<button type="button" class="chip ${l.symptoms.some(s=>s.name===v)?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div></div>
-  <div class="field"><label>Mood</label><div class="chips" data-multi="moods">${moods.map(v=>`<button type="button" class="chip ${l.moods.includes(v)?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div></div>
-  <div class="field"><label>Energy</label><div class="chips" data-single="energy">${['Very low','Low','Average','High','Very high'].map((v,i)=>`<button type="button" class="chip ${l.energy===i+1?'selected':''}" data-value="${i+1}">${v}</button>`).join('')}</div><input type="hidden" name="energy" value="${l.energy||''}"></div>
-  <div class="grid-2"><div class="field"><label for="sleepHours">Sleep hours</label><input class="input" id="sleepHours" name="sleepHours" type="number" min="0" max="24" step="0.5" value="${l.sleepHours||''}"></div><div class="field"><label>Sleep quality</label><div class="chips" data-single="sleepQuality">${['poor','fair','good','excellent'].map(v=>`<button type="button" class="chip ${l.sleepQuality===v?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="sleepQuality" value="${l.sleepQuality||''}"></div></div>
-  ${state.settings.trackCervicalFluid?`<div class="field"><label>Cervical fluid</label><div class="chips" data-single="cervicalFluid">${['dry','sticky','creamy','watery','egg-white','unsure'].map(v=>`<button type="button" class="chip ${l.cervicalFluid===v?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="cervicalFluid" value="${l.cervicalFluid||''}"></div>`:''}
-  ${state.settings.trackSexualActivity?`<div class="field"><label>Sexual activity</label><div class="chips" data-multi="sexualActivity">${['sexual activity','protected','unprotected','high libido','low libido'].map(v=>`<button type="button" class="chip ${(l.sexualActivity||[]).includes(v)?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div></div>`:''}
-  ${state.settings.trackTests?`<div class="field"><label>Pregnancy test</label><div class="chips" data-single="pregnancyTest">${['positive','negative','unclear'].map(v=>`<button type="button" class="chip ${l.pregnancyTest===v?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="pregnancyTest" value="${l.pregnancyTest||''}"></div><div class="field"><label>Ovulation test</label><div class="chips" data-single="ovulationTest">${['positive','negative','unclear'].map(v=>`<button type="button" class="chip ${l.ovulationTest===v?'selected':''}" data-value="${v}">${capitalize(v)}</button>`).join('')}</div><input type="hidden" name="ovulationTest" value="${l.ovulationTest||''}"></div>`:''}
-  <div class="field"><label for="medication">Medication or relief used</label><input class="input" id="medication" name="medication" maxlength="200" value="${escapeHTML(l.medication||'')}"></div><div class="field"><label for="notes">Notes</label><textarea class="input" id="notes" name="notes" maxlength="2000">${escapeHTML(l.notes||'')}</textarea></div>
-  <div class="button-row">${state.logs[date]?'<button type="button" class="danger-button" data-action="delete-log" data-date="'+date+'">Delete</button>':''}<button class="primary-button" type="submit">Save entry</button></div></form>`);
+  const energyLabels=['Very low','Low','Average','High','Very high'];
+  // Less-used fields live under "More details", opened automatically when the entry already uses them.
+  const hasMore=Boolean(l.sleepHours||l.sleepQuality||l.cervicalFluid||(l.sexualActivity||[]).length||l.pregnancyTest||l.ovulationTest||l.medication||l.notes);
+  const moreParts=['sleep',state.settings.trackCervicalFluid&&'cervical fluid',state.settings.trackSexualActivity&&'activity',state.settings.trackTests&&'tests','medication','notes'].filter(Boolean);
+  const moreSummary=sentenceCase(moreParts.slice(0,-1).join(', ')+' and '+moreParts.at(-1));
+  showModal(`<div class="modal-head"><div><p class="eyebrow">Daily log</p><h2>${fmtDate(date,{weekday:'long',day:'numeric',month:'long'})}</h2></div><button class="close-button" data-action="close-modal" aria-label="Close">×</button></div><form id="logForm" data-date="${date}">
+  ${chipField('Bleeding','single','bleeding',bleed,v=>l.bleeding===v,{selectedClass:'period-selected'})}
+  <label class="switch-row"><span><b>Count as part of a period</b><small>On automatically for light, medium or heavy bleeding. Spotting only starts a new cycle if you turn this on.</small></span><input type="checkbox" class="switch" name="countsAsPeriod" role="switch" ${l.countsAsPeriod?'checked':''}></label>
+  ${chipField('Physical symptoms','multi','symptoms',symptoms,v=>l.symptoms.some(s=>s.name===v))}
+  ${chipField('Mood','multi','moods',moods,v=>l.moods.includes(v))}
+  ${chipField('Energy','single','energy',[1,2,3,4,5],v=>l.energy===v,{labelOf:v=>energyLabels[v-1]})}
+  <details class="more-details" ${hasMore?'open':''}><summary><span><b>More details</b><small>${moreSummary}</small></span></summary>
+    <div class="field"><label for="sleepHours">Sleep hours</label><input class="input" id="sleepHours" name="sleepHours" type="number" inputmode="decimal" min="0" max="24" step="0.5" value="${l.sleepHours||''}"></div>
+    ${chipField('Sleep quality','single','sleepQuality',['poor','fair','good','excellent'],v=>l.sleepQuality===v)}
+    ${state.settings.trackCervicalFluid?chipField('Cervical fluid','single','cervicalFluid',['dry','sticky','creamy','watery','egg-white','unsure'],v=>l.cervicalFluid===v):''}
+    ${state.settings.trackSexualActivity?chipField('Sexual activity','multi','sexualActivity',['sexual activity','protected','unprotected','high libido','low libido'],v=>(l.sexualActivity||[]).includes(v)):''}
+    ${state.settings.trackTests?chipField('Pregnancy test','single','pregnancyTest',['positive','negative','unclear'],v=>l.pregnancyTest===v)+chipField('Ovulation test','single','ovulationTest',['positive','negative','unclear'],v=>l.ovulationTest===v):''}
+    <div class="field"><label for="medication">Medication or relief used</label><input class="input" id="medication" name="medication" maxlength="200" value="${escapeHTML(l.medication||'')}"></div>
+    <div class="field"><label for="notes">Notes</label><textarea class="input" id="notes" name="notes" maxlength="2000">${escapeHTML(l.notes||'')}</textarea></div>
+  </details>
+  <div class="sheet-footer">${state.logs[date]?'<button type="button" class="danger-button" data-action="delete-log" data-date="'+date+'">Delete</button>':''}<button class="primary-button" type="submit">Save entry</button></div></form>`);
+}
+function celebrateFirstCycle(){
+  showModal(`<div class="celebration" aria-hidden="true">${Array.from({length:18},(_,i)=>`<i style="--i:${i}"></i>`).join('')}</div>
+    <div class="celebration-copy"><div class="hero-orb"><span>◐</span></div><p class="eyebrow">Milestone</p><h2>Your first full cycle is recorded</h2>
+    <p class="muted">Luna Daily can now use your own history for its estimates, and they’ll get better with every cycle you log.</p>
+    <button class="primary-button" data-action="close-modal">Lovely</button></div>`);
 }
 function editCycleModal(){showModal(`<div class="modal-head"><h2>Cycle settings</h2><button class="close-button" data-action="close-modal">×</button></div><form id="cycleSettingsForm"><div class="field"><label for="recentPeriodStart">Most recent known period start</label><input class="input" id="recentPeriodStart" name="recentPeriodStart" type="date" max="${todayISO()}" value="${state.settings.recentPeriodStart}"></div><div class="field"><label for="typicalCycleLength">Typical cycle length</label><input class="input" id="typicalCycleLength" name="typicalCycleLength" type="number" min="15" max="60" value="${state.settings.typicalCycleLength}"></div><div class="field"><label for="typicalPeriodLength">Typical period length</label><input class="input" id="typicalPeriodLength" name="typicalPeriodLength" type="number" min="1" max="14" value="${state.settings.typicalPeriodLength}"></div><button class="primary-button">Save settings</button></form>`)}
 
@@ -370,10 +475,10 @@ function bindEvents(){
     if(a==='start-onboarding')onboardingModal();
     if(a==='close-modal')closeModal();
     if(a==='log-date')logModal(btn.dataset.date);
-    if(a==='select-day'){selectedCalendarDate=btn.dataset.date;renderCalendar()}
-    if(a==='month-prev'){calendarCursor.setMonth(calendarCursor.getMonth()-1);renderCalendar()}
-    if(a==='month-next'){calendarCursor.setMonth(calendarCursor.getMonth()+1);renderCalendar()}
-    if(a==='toggle-setting'){const k=btn.dataset.key;state.settings[k]=!state.settings[k];await saveState();render()}
+    if(a==='select-day'&&!suppressDayTap){selectedCalendarDate=btn.dataset.date;renderCalendar()}
+    if(a==='month-prev')changeMonth(-1);
+    if(a==='month-next')changeMonth(1);
+    if(a==='toggle-setting'){const k=btn.dataset.key;state.settings[k]=!state.settings[k];haptic();await saveState();render()}
     if(a==='cycle-theme'){state.settings.theme={dark:'light',light:'system',system:'dark'}[state.settings.theme];await saveState();render()}
     if(a==='edit-cycle-settings')editCycleModal();
     if(a==='export-backup')backupPrompt();
@@ -386,6 +491,8 @@ function bindEvents(){
     }
     if(a==='ack-update'){state.notifications.lastSeenAppVersion=APP_VERSION;state.notifications.updatedFromVersion=null;await saveState();render()}
     if(a==='view-calendar')navigate('calendar');
+    if(a==='calendar-today'){calendarCursor=new Date();calendarCursor.setDate(1);selectedCalendarDate=todayISO();renderCalendar()}
+    if(a==='open-month'){const d=parseISO(btn.dataset.date);calendarCursor=new Date(d.getFullYear(),d.getMonth(),1);selectedCalendarDate=btn.dataset.date;navigate('calendar')}
     if(a==='view-insights')navigate('insights');
     if(a==='scroll-cycle')document.querySelector('.phase-journey')?.scrollIntoView({behavior:'smooth',block:'center'});
     if(a==='mark-cycle-summary'){
@@ -399,7 +506,7 @@ function bindEvents(){
   document.addEventListener('submit',async e=>{
     e.preventDefault();const f=e.target;
     if(f.id==='onboardingForm'){const data=new FormData(f);state.settings.recentPeriodStart=data.get('recentStart');state.settings.typicalCycleLength=Number(data.get('cycleLength'));state.settings.typicalPeriodLength=Number(data.get('periodLength'));state.onboardingComplete=true;state.logs[state.settings.recentPeriodStart]=seedPeriodLog(state.settings.recentPeriodStart);rebuildPeriods();await saveState();closeModal();setHeader();render();toast('Your tracker is ready')}
-    if(f.id==='logForm'){const data=new FormData(f),date=f.dataset.date;const existing=state.logs[date];state.logs[date]={date,bleeding:data.get('bleeding'),countsAsPeriod:data.get('countsAsPeriod')==='on',symptoms:selectedValues(f,'symptoms').map(name=>({name,severity:'moderate'})),moods:selectedValues(f,'moods'),energy:Number(data.get('energy'))||null,sleepHours:data.get('sleepHours')?Number(data.get('sleepHours')):'',sleepQuality:data.get('sleepQuality')||'',cervicalFluid:data.get('cervicalFluid')||null,sexualActivity:selectedValues(f,'sexualActivity'),pregnancyTest:data.get('pregnancyTest')||null,ovulationTest:data.get('ovulationTest')||null,medication:data.get('medication').trim(),notes:data.get('notes').trim(),createdAt:existing?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};rebuildPeriods();state.notifications.dismissed[notificationKey('daily-checkin',date)]='forever';await saveState();closeModal();render();toast('Entry saved')}
+    if(f.id==='logForm'){const data=new FormData(f),date=f.dataset.date;const existing=state.logs[date];const cyclesBefore=cycleData().lengths.length;state.logs[date]={date,bleeding:data.get('bleeding'),countsAsPeriod:data.get('countsAsPeriod')==='on',symptoms:selectedValues(f,'symptoms').map(name=>({name,severity:'moderate'})),moods:selectedValues(f,'moods'),energy:Number(data.get('energy'))||null,sleepHours:data.get('sleepHours')?Number(data.get('sleepHours')):'',sleepQuality:data.get('sleepQuality')||'',cervicalFluid:data.get('cervicalFluid')||null,sexualActivity:selectedValues(f,'sexualActivity'),pregnancyTest:data.get('pregnancyTest')||null,ovulationTest:data.get('ovulationTest')||null,medication:data.get('medication').trim(),notes:data.get('notes').trim(),createdAt:existing?.createdAt||new Date().toISOString(),updatedAt:new Date().toISOString()};rebuildPeriods();state.notifications.dismissed[notificationKey('daily-checkin',date)]='forever';const firstCycle=cyclesBefore===0&&cycleData().lengths.length>0&&!state.notifications.celebratedFirstCycle;if(firstCycle)state.notifications.celebratedFirstCycle=true;await saveState();closeModal();render();haptic();if(firstCycle)celebrateFirstCycle();else toast('Entry saved')}
     if(f.id==='cycleSettingsForm'){const data=new FormData(f);setRecentPeriodStart(data.get('recentPeriodStart'));state.settings.typicalCycleLength=clamp(Number(data.get('typicalCycleLength')),15,60);state.settings.typicalPeriodLength=clamp(Number(data.get('typicalPeriodLength')),1,14);await saveState();closeModal();render();toast('Settings saved')}
     if(f.id==='backupForm'){const data=new FormData(f),password=String(data.get('password')||''),confirm=String(data.get('confirmPassword')||'');if(password&&password.length<8){toast('Use at least 8 characters');return}if(password!==confirm){toast('Passwords do not match');return}await exportBackup(password)}
     if(f.id==='restoreForm')await restoreFromFile(f);
@@ -412,6 +519,13 @@ function bindEvents(){
     if(!document.hidden&&renderedOn!==todayISO()){setHeader();if(!$('#modalRoot').innerHTML)render()}
   });
   document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('#modalRoot').innerHTML)closeModal()});
+  // Swipe left or right on the calendar to change month.
+  let swipe=null;
+  document.addEventListener('touchstart',e=>{const grid=e.target.closest('.calendar-grid');swipe=grid&&e.touches.length===1?{x:e.touches[0].clientX,y:e.touches[0].clientY}:null},{passive:true});
+  document.addEventListener('touchend',e=>{
+    if(!swipe)return;const t=e.changedTouches[0],dx=t.clientX-swipe.x,dy=t.clientY-swipe.y;swipe=null;
+    if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)*1.5){suppressDayTap=true;changeMonth(dx<0?1:-1);setTimeout(()=>suppressDayTap=false,350)}
+  },{passive:true});
 }
 function selectedValues(form,name){const group=form.querySelector(`[data-multi="${name}"]`);return group?[...group.querySelectorAll('.chip.selected')].map(x=>x.dataset.value):[]}
 
@@ -506,6 +620,7 @@ if (globalThis.__LUNA_TEST_MODE__) {
   globalThis.__LUNA_TEST_API__ = {
     parseISO, dateToISO, addDays, daysBetween, clamp, mean, rebuildPeriods, cycleData, buildNotifications, notificationKey, isNotificationDismissed,
     averagePeriodLength, migrateState, setRecentPeriodStart, compareVersions, isPeriodLog,
+    fertileWindow, projectedCycles, ringSegments, calendarMarks, sentenceCase,
     setState(value) { state = structuredClone(value); },
     getState() { return structuredClone(state); },
     defaultState: structuredClone(defaultState)

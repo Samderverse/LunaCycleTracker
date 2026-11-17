@@ -1,4 +1,4 @@
-# Luna Daily v2.1.1
+# Luna Daily v3.0.0
 
 A private, mobile-first period and cycle tracker for one person's personal use.
 
@@ -10,11 +10,11 @@ A private, mobile-first period and cycle tracker for one person's personal use.
 - Period and spotting logging
 - Symptoms, mood, energy, sleep, medication and notes
 - Optional cervical-fluid, sexual-activity, pregnancy-test and ovulation-test tracking
-- Monthly calendar with logged and predicted period dates
+- Monthly calendar with logged periods, the next three predicted periods, optional fertile-window and ovulation estimates, and swipe between months
 - Transparent cycle-length and next-period estimates
 - Menstrual, follicular, estimated ovulation and luteal phase display
 - Optional estimated fertile window with safety wording
-- Personal cycle and symptom insights
+- Personal cycle and symptom insights, with your usual cycle range highlighted
 - Dark, light and device themes
 - Privacy curtain in the app switcher
 - Plain or password-encrypted backups using PBKDF2 and AES-GCM
@@ -55,4 +55,4 @@ Then open `http://localhost:8000`.
 
 ## Smart in-app reminders
 
-Luna Daily can show private reminders when the app is opened. These are calculated locally and are not push notifications. They include daily check-ins, period-due estimates, optional fertile-window estimates, backup reminders, end-of-cycle summaries, personal symptom patterns, and app-update notices. They can be switched off in Settings.
+Luna Daily can show private reminders when the app is opened. These are calculated locally and are not push notifications. They include daily check-ins, optional fertile-window estimates, backup reminders, end-of-cycle summaries, personal symptom patterns, and app-update notices. They can be switched off in Settings. The period-due estimate is shown in the main card on Today rather than as a separate reminder.
